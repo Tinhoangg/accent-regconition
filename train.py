@@ -22,7 +22,7 @@ from tqdm import tqdm
 from config import FEATURES, PATHS, TRAINING
 from feature_extraction import FEATURE_NAMES, extract_sequence
 from model import build_model
-from processing import align_syllables, decode_audio_field, preprocess_audio, stream_metadata_samples, stream_raw_samples
+from processing import align_syllables, decode_audio_field, preprocess_audio, segment_syllables, stream_metadata_samples, stream_raw_samples
 from utils import ensure_dirs, print_evaluation, set_seed, setup_logging
 
 
@@ -375,6 +375,60 @@ def collect_features(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, 
     return collect_features_parallel(args)
 
 
+
+def debug_syllable_extraction(args: argparse.Namespace, logger: logging.Logger) -> None:
+    label2id = TRAINING.label2id
+    checked = 0
+    target_counts = {label: 0 for label in label2id}
+    manifest_entries = load_manifest(Path(args.manifest_path)) if args.use_manifest else None
+    manifest_by_filename = {str(item["filename"]): item for item in manifest_entries} if manifest_entries is not None else None
+    whisper = WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type)
+    temp_dir = PATHS.data_dir / "tmp_wav" / "debug"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    iterator = stream_raw_samples(split=args.split, shuffle=args.shuffle, seed=args.seed, buffer_size=args.buffer_size)
+    for index, sample in enumerate(tqdm(iterator, desc="Debug syllables")):
+        if index >= args.max_scan or checked >= args.debug_syllables_only:
+            break
+        if manifest_by_filename is not None:
+            manifest_item = manifest_by_filename.get(sample.filename)
+            if manifest_item is None or manifest_item["region"] != sample.region:
+                continue
+        if sample.region not in label2id or target_counts[sample.region] >= args.max_per_class:
+            continue
+        try:
+            raw_audio, raw_sr = decode_audio_field(sample.audio_field)
+            raw_array = np.asarray(raw_audio)
+            raw_shape = tuple(raw_array.shape)
+            raw_duration = raw_array.shape[0] / max(raw_sr, 1) if raw_array.ndim > 0 else 0.0
+            raw_peak = float(np.max(np.abs(raw_array))) if raw_array.size else 0.0
+            audio, sr = preprocess_audio(raw_audio, raw_sr)
+            processed_peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            transcript_syllables = segment_syllables(sample.transcript)
+            segments = align_syllables(audio, sr, sample.transcript, whisper, temp_dir / f"debug_{sample.filename}.wav")
+            sequence = extract_sequence(audio, sr, segments)
+            checked += 1
+            target_counts[sample.region] += 1
+            processed_duration = len(audio) / sr
+            last_end = segments[-1].end if segments else 0.0
+            coverage_ratio = last_end / max(processed_duration, 1e-6)
+            matched_segments = sum(segment.score is not None for segment in segments)
+            matched_ratio = matched_segments / max(len(segments), 1)
+            preview_tokens = " ".join(transcript_syllables[:20])
+            preview_segments = ", ".join(f"{seg.syllable}:{seg.start:.2f}-{seg.end:.2f}" for seg in segments[:10])
+            tail_segments = ", ".join(f"{seg.syllable}:{seg.start:.2f}-{seg.end:.2f}" for seg in segments[-10:])
+            logger.info(
+                "SYLLABLE_DEBUG %s/%s | file=%s | region=%s | raw_shape=%s | raw_duration=%.2fs | processed_duration=%.2fs | last_end=%.2fs | coverage_ratio=%.3f | raw_peak=%.6f | processed_peak=%.6f | transcript_syllables=%s | aligned_segments=%s | sequence_len=%s | matched_ratio=%.3f | first_tokens=%s | first_segments=%s | last_segments=%s",
+                checked, args.debug_syllables_only, sample.filename, sample.region, raw_shape, raw_duration, processed_duration, last_end, coverage_ratio, raw_peak, processed_peak,
+                len(transcript_syllables), len(segments), sequence.shape[0], matched_ratio, preview_tokens, preview_segments, tail_segments,
+            )
+        except Exception as exc:
+            checked += 1
+            logger.warning("SYLLABLE_DEBUG failed %s/%s | file=%s | region=%s | error=%s",
+                           checked, args.debug_syllables_only, sample.filename, sample.region, exc)
+    logger.info("SYLLABLE_DEBUG done | checked=%s | counts=%s", checked, target_counts)
+
+
 def default_cache_path(args: argparse.Namespace) -> Path:
     shuffle_tag = "shuffle" if args.shuffle else "ordered"
     return PATHS.features_dir / f"{args.split}_{shuffle_tag}_{args.whisper_model}_{args.max_per_class}_per_class_{FEATURES.feature_dim}d.npz"
@@ -525,6 +579,7 @@ def main() -> None:
     parser.add_argument("--manifest-path", default=None)
     parser.add_argument("--build-manifest-only", action="store_true")
     parser.add_argument("--use-manifest", action="store_true")
+    parser.add_argument("--debug-syllables-only", type=int, default=0)
     args = parser.parse_args()
 
     ensure_dirs([PATHS.data_dir, PATHS.features_dir, PATHS.checkpoints_dir, PATHS.logs_dir])
@@ -539,6 +594,9 @@ def main() -> None:
         return
     if args.use_manifest and not manifest_path.exists():
         raise FileNotFoundError(f"Manifest file does not exist: {manifest_path}")
+    if args.debug_syllables_only > 0:
+        debug_syllable_extraction(args, logger)
+        return
 
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():

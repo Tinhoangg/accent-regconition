@@ -67,10 +67,18 @@ def preprocess_audio(audio: np.ndarray, sr: int, target_sr: int = AUDIO.sample_r
     """Convert audio to mono 16 kHz, trim silence and normalize amplitude."""
     y = np.asarray(audio, dtype=np.float32)
     if y.ndim > 1:
-        y = np.mean(y, axis=0)
+        if y.shape[0] <= 8 and y.shape[1] > y.shape[0]:
+            y = np.mean(y, axis=0)
+        else:
+            y = np.mean(y, axis=1)
     if sr != target_sr:
         y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
-    y, _ = librosa.effects.trim(y, top_db=AUDIO.trim_top_db)
+
+    pre_trim_audio = y.copy()
+    trimmed, _ = librosa.effects.trim(y, top_db=AUDIO.trim_top_db)
+    min_samples = max(1, int(AUDIO.min_syllable_duration * target_sr))
+    y = trimmed if len(trimmed) >= min_samples else pre_trim_audio
+
     peak = float(np.max(np.abs(y))) if y.size else 0.0
     if peak > 0:
         y = y / peak
@@ -192,11 +200,19 @@ def save_temp_wav(audio: np.ndarray, sr: int, path: Path) -> None:
 
 def _word_key(word: str) -> str:
     """Normalize a word for fuzzy transcript/ASR matching."""
-    word = unicodedata.normalize("NFD", preprocess_transcript(word))
+    word = preprocess_transcript(word).replace("đ", "d")
+    word = unicodedata.normalize("NFD", word)
     word = "".join(char for char in word if unicodedata.category(char) != "Mn")
-    word = word.replace("đ", "d")
     return re.sub(r"[^a-z0-9]", "", word)
 
+
+def _similar_word_key(left: str, right: str) -> bool:
+    """Return whether two normalized word keys are close enough to share timing."""
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    return SequenceMatcher(a=left, b=right, autojunk=False).ratio() >= 0.78
 
 def transcribe_word_timestamps(model: WhisperModel, wav_path: Path) -> list[SyllableSegment]:
     """Use faster-whisper native word timestamps as timing anchors."""
@@ -205,7 +221,7 @@ def transcribe_word_timestamps(model: WhisperModel, wav_path: Path) -> list[Syll
         language="vi",
         beam_size=5,
         word_timestamps=True,
-        vad_filter=True,
+        vad_filter=False,
         condition_on_previous_text=False,
     )
     words: list[SyllableSegment] = []
@@ -229,7 +245,7 @@ def map_transcript_to_timestamps(
     asr_words: list[SyllableSegment],
     audio_duration: float,
 ) -> list[SyllableSegment]:
-    """Keep transcript syllables while borrowing timestamps from ASR word anchors."""
+    """Keep transcript syllables while borrowing only reliable ASR timing anchors."""
     if not syllables:
         return []
     if not asr_words:
@@ -245,8 +261,19 @@ def map_transcript_to_timestamps(
     mapped: list[SyllableSegment | None] = [None] * len(syllables)
 
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal" or (tag == "replace" and i2 - i1 == j2 - j1):
+        if tag == "equal":
             for ref_idx, asr_idx in zip(range(i1, i2), range(j1, j2)):
+                asr = asr_words[asr_idx]
+                mapped[ref_idx] = SyllableSegment(
+                    syllable=syllables[ref_idx],
+                    start=asr.start,
+                    end=asr.end,
+                    score=asr.score,
+                )
+        elif tag == "replace" and i2 - i1 == j2 - j1:
+            for ref_idx, asr_idx in zip(range(i1, i2), range(j1, j2)):
+                if not _similar_word_key(reference_keys[ref_idx], asr_keys[asr_idx]):
+                    continue
                 asr = asr_words[asr_idx]
                 mapped[ref_idx] = SyllableSegment(
                     syllable=syllables[ref_idx],
@@ -266,6 +293,9 @@ def map_transcript_to_timestamps(
         end_idx = idx
         left_time = mapped[start_idx - 1].end if start_idx > 0 and mapped[start_idx - 1] else 0.0
         right_time = mapped[end_idx].start if end_idx < len(mapped) and mapped[end_idx] else audio_duration
+        if right_time <= left_time:
+            left_time = (start_idx / len(syllables)) * audio_duration
+            right_time = (end_idx / len(syllables)) * audio_duration
         step = max(0.0, right_time - left_time) / max(1, end_idx - start_idx)
         for offset, ref_idx in enumerate(range(start_idx, end_idx)):
             mapped[ref_idx] = SyllableSegment(
