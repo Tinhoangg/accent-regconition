@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import logging
 import os
@@ -369,6 +370,183 @@ def collect_features_parallel(args: argparse.Namespace) -> tuple[np.ndarray, np.
     return np.asarray(sequences, dtype=object), np.asarray(labels, dtype=np.int64), speakers
 
 
+def default_chunk_dir(cache_path: Path) -> Path:
+    """Return the directory used for resumable feature chunks."""
+    return cache_path.with_suffix("").parent / f"{cache_path.with_suffix('').name}_chunks"
+
+
+def chunk_paths(chunk_dir: Path) -> list[Path]:
+    """Return existing chunk files in deterministic order."""
+    return sorted(chunk_dir.glob("chunk_*.npz"))
+
+
+def save_feature_chunk(
+    chunk_dir: Path,
+    chunk_id: int,
+    sequences: list[np.ndarray],
+    labels: list[int],
+    speakers: list[str],
+    filenames: list[str],
+    max_len: int,
+    logger: logging.Logger,
+) -> Path:
+    """Pad and save one resumable extraction chunk, then return its path."""
+    if not sequences:
+        raise ValueError("Cannot save an empty feature chunk.")
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    x_chunk, y_chunk = prepare_arrays(np.asarray(sequences, dtype=object), np.asarray(labels, dtype=np.int64), max_len)
+    path = chunk_dir / f"chunk_{chunk_id:05d}.npz"
+    np.savez_compressed(
+        path,
+        x=x_chunk,
+        y=y_chunk,
+        speakers=np.asarray(speakers),
+        filenames=np.asarray(filenames),
+        feature_names=np.asarray(FEATURE_NAMES),
+        label_names=np.asarray(LABEL_NAMES),
+    )
+    logger.info("Saved feature chunk: %s | samples=%s | shape=%s", path, len(y_chunk), x_chunk.shape)
+    return path
+
+
+def load_feature_chunks(chunk_dir: Path, logger: logging.Logger) -> tuple[np.ndarray, np.ndarray, np.ndarray, set[str], dict[str, int]] | None:
+    """Load all existing chunks and derive resume state."""
+    paths = chunk_paths(chunk_dir)
+    if not paths:
+        return None
+    xs, ys, speakers, done_filenames = [], [], [], set()
+    for path in paths:
+        data = np.load(path, allow_pickle=True)
+        if "x" not in data or "y" not in data:
+            logger.warning("Ignoring invalid feature chunk: %s", path)
+            continue
+        x_chunk = data["x"].astype(np.float32)
+        y_chunk = data["y"].astype(np.int64)
+        if x_chunk.ndim != 3 or x_chunk.shape[-1] != FEATURES.feature_dim:
+            raise ValueError(f"Chunk feature dim mismatch in {path}: {x_chunk.shape}")
+        xs.append(x_chunk)
+        ys.append(y_chunk)
+        if "speakers" in data:
+            speakers.extend([str(item) for item in data["speakers"]])
+        else:
+            speakers.extend([""] * len(y_chunk))
+        if "filenames" in data:
+            done_filenames.update(str(item) for item in data["filenames"])
+    if not xs:
+        return None
+    x = np.concatenate(xs, axis=0)
+    y = np.concatenate(ys, axis=0)
+    counts = class_count_dict(y)
+    logger.info("Loaded feature chunks: %s | samples=%s | counts=%s", len(xs), len(y), counts)
+    return x, y, np.asarray(speakers), done_filenames, counts
+
+
+def collect_features_chunked(args: argparse.Namespace, cache_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract features into resumable on-disk chunks, then merge chunks for training."""
+    logger = setup_logging(PATHS.logs_dir)
+    label2id = TRAINING.label2id
+    id2label = {idx: label for label, idx in label2id.items()}
+    chunk_dir = Path(args.chunk_dir) if args.chunk_dir else default_chunk_dir(cache_path)
+    loaded = load_feature_chunks(chunk_dir, logger)
+    done_filenames: set[str] = set()
+    if loaded is None:
+        target_counts = {label: 0 for label in label2id}
+        next_chunk_id = 0
+    else:
+        _, y_existing, _, done_filenames, _ = loaded
+        target_counts = {label: 0 for label in label2id}
+        for label_id, count in zip(*np.unique(y_existing, return_counts=True)):
+            target_counts[id2label[int(label_id)]] = int(count)
+        next_chunk_id = len(chunk_paths(chunk_dir))
+
+    if all(count >= args.max_per_class for count in target_counts.values()):
+        logger.info("Chunk cache already satisfies target counts: %s", target_counts)
+        merged = load_feature_chunks(chunk_dir, logger)
+        if merged is None:
+            raise RuntimeError("Chunk cache disappeared while loading.")
+        return merged[0], merged[1], merged[2]
+
+    if args.num_workers > 1:
+        logger.warning("Chunk cache extraction uses one Whisper worker to keep RAM bounded; ignoring --num-workers=%s during extraction.", args.num_workers)
+
+    manifest_entries = load_manifest(Path(args.manifest_path)) if args.use_manifest else None
+    manifest_by_filename = {str(item["filename"]): item for item in manifest_entries} if manifest_entries is not None else None
+    if manifest_by_filename is not None:
+        logger.info("Using metadata manifest with chunk cache: %s | samples=%s", args.manifest_path, len(manifest_by_filename))
+
+    whisper = WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type)
+    temp_dir = PATHS.data_dir / "tmp_wav" / "chunks"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    iterator = stream_raw_samples(split=args.split, shuffle=args.shuffle, seed=args.seed, buffer_size=args.buffer_size)
+
+    chunk_sequences: list[np.ndarray] = []
+    chunk_labels: list[int] = []
+    chunk_speakers: list[str] = []
+    chunk_filenames: list[str] = []
+    alignment_stats = {"segments": 0, "matched_or_replaced": 0, "interpolated_or_fallback": 0}
+    scanned = 0
+
+    def flush_chunk() -> None:
+        nonlocal next_chunk_id, chunk_sequences, chunk_labels, chunk_speakers, chunk_filenames
+        if not chunk_sequences:
+            return
+        save_feature_chunk(chunk_dir, next_chunk_id, chunk_sequences, chunk_labels, chunk_speakers, chunk_filenames, args.max_len, logger)
+        next_chunk_id += 1
+        chunk_sequences.clear()
+        chunk_labels.clear()
+        chunk_speakers.clear()
+        chunk_filenames.clear()
+        gc.collect()
+
+    for index, sample in enumerate(tqdm(iterator, desc="Streaming ViMD")):
+        scanned = index + 1
+        if index >= args.max_scan or all(count >= args.max_per_class for count in target_counts.values()):
+            break
+        if sample.filename in done_filenames:
+            continue
+        if manifest_by_filename is not None:
+            manifest_item = manifest_by_filename.get(sample.filename)
+            if manifest_item is None or manifest_item["region"] != sample.region:
+                continue
+        if sample.region not in label2id or target_counts[sample.region] >= args.max_per_class:
+            continue
+        try:
+            raw_audio, raw_sr = decode_audio_field(sample.audio_field)
+            audio, sr = preprocess_audio(raw_audio, raw_sr)
+            safe_filename = str(sample.filename).replace("/", "_").replace("\\", "_")
+            segments = align_syllables(audio, sr, sample.transcript, whisper, temp_dir / f"chunk_{safe_filename}.wav")
+            matched_segments = sum(segment.score is not None for segment in segments)
+            alignment_stats["segments"] += len(segments)
+            alignment_stats["matched_or_replaced"] += matched_segments
+            alignment_stats["interpolated_or_fallback"] += len(segments) - matched_segments
+            sequence = extract_sequence(audio, sr, segments)
+            if sequence.shape[0] < args.min_syllables:
+                continue
+            chunk_sequences.append(sequence)
+            chunk_labels.append(label2id[sample.region])
+            chunk_speakers.append(sample.speaker_id)
+            chunk_filenames.append(sample.filename)
+            done_filenames.add(sample.filename)
+            target_counts[sample.region] += 1
+            logger.info("Collected valid sample %s/%s | %s | counts=%s",
+                        sum(target_counts.values()), args.max_per_class * len(label2id), sample.filename, target_counts)
+            if len(chunk_sequences) >= args.chunk_size:
+                flush_chunk()
+        except Exception as exc:
+            logger.warning("Skipping %s: %s", sample.filename, exc)
+
+    flush_chunk()
+    logger.info("Final chunked collected counts: %s | scanned=%s | chunks=%s", target_counts, scanned, len(chunk_paths(chunk_dir)))
+    if alignment_stats["segments"]:
+        logger.info("Alignment diagnostics | segments=%s | matched_or_replaced=%s | interpolated_or_fallback=%s | matched_ratio=%.4f",
+                    alignment_stats["segments"], alignment_stats["matched_or_replaced"], alignment_stats["interpolated_or_fallback"],
+                    alignment_stats["matched_or_replaced"] / alignment_stats["segments"])
+    merged = load_feature_chunks(chunk_dir, logger)
+    if merged is None:
+        raise RuntimeError("No feature chunks were extracted.")
+    return merged[0], merged[1], merged[2]
+
+
 def collect_features(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[str]]:
     if args.num_workers <= 1:
         return collect_features_serial(args)
@@ -580,6 +758,8 @@ def main() -> None:
     parser.add_argument("--build-manifest-only", action="store_true")
     parser.add_argument("--use-manifest", action="store_true")
     parser.add_argument("--debug-syllables-only", type=int, default=0)
+    parser.add_argument("--chunk-size", type=int, default=0, help="Save feature extraction chunks every N valid samples; enables resume.")
+    parser.add_argument("--chunk-dir", default=None, help="Optional directory for feature chunks.")
     args = parser.parse_args()
 
     ensure_dirs([PATHS.data_dir, PATHS.features_dir, PATHS.checkpoints_dir, PATHS.logs_dir])
@@ -615,9 +795,12 @@ def main() -> None:
         x, y, speakers = cached
         logger.info("Loaded cached features: %s | shape=%s", cache_path, x.shape)
     else:
-        sequences, labels, speaker_list = collect_features(args)
-        x, y = prepare_arrays(sequences, labels, args.max_len)
-        speakers = np.asarray(speaker_list)
+        if args.chunk_size > 0:
+            x, y, speakers = collect_features_chunked(args, cache_path)
+        else:
+            sequences, labels, speaker_list = collect_features(args)
+            x, y = prepare_arrays(sequences, labels, args.max_len)
+            speakers = np.asarray(speaker_list)
         save_cached_features(cache_path, x, y, speakers)
         logger.info("Saved feature cache: %s | shape=%s", cache_path, x.shape)
     log_feature_diagnostics(logger, x, y, speakers, prefix="Dataset")
