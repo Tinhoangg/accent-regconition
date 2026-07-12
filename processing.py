@@ -21,6 +21,16 @@ from config import AUDIO, TRAINING
 
 
 @dataclass
+class MetadataStreamSample:
+    """A streaming sample containing only dataset metadata."""
+
+    transcript: str
+    region: str
+    speaker_id: str
+    filename: str
+
+
+@dataclass
 class RawStreamSample:
     """A streaming sample with metadata read before audio decoding."""
 
@@ -89,6 +99,33 @@ def decode_audio_field(audio_field: dict) -> tuple[np.ndarray, int]:
         raise ValueError(f"Audio bytes are missing for path={audio_field.get('path')}")
     audio, sr = sf.read(io.BytesIO(audio_bytes), always_2d=False)
     return audio, int(sr)
+
+
+def stream_metadata_samples(
+    dataset_name: str = TRAINING.dataset_name,
+    split: str = TRAINING.split,
+    shuffle: bool = False,
+    seed: int = TRAINING.random_state,
+    buffer_size: int = 1000,
+) -> Generator[MetadataStreamSample, None, None]:
+    """Stream ViMD metadata without materializing the audio column."""
+    dataset = load_dataset(dataset_name, split=split, streaming=True)
+    if "audio" in getattr(dataset, "column_names", []):
+        dataset = dataset.cast_column("audio", Audio(decode=False))
+        dataset = dataset.remove_columns(["audio"])
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=buffer_size, seed=seed)
+
+    for item in dataset:
+        try:
+            yield MetadataStreamSample(
+                transcript=preprocess_transcript(item["text"]),
+                region=str(item["region"]),
+                speaker_id=str(item["speakerID"]),
+                filename=str(item["filename"]),
+            )
+        except Exception:
+            continue
 
 
 def stream_raw_samples(

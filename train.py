@@ -20,11 +20,73 @@ from tqdm import tqdm
 from config import FEATURES, PATHS, TRAINING
 from feature_extraction import FEATURE_NAMES, extract_sequence
 from model import build_model
-from processing import align_syllables, decode_audio_field, preprocess_audio, stream_raw_samples
+from processing import align_syllables, decode_audio_field, preprocess_audio, stream_metadata_samples, stream_raw_samples
 from utils import ensure_dirs, print_evaluation, set_seed, setup_logging
 
 
 LABEL_NAMES = list(TRAINING.label2id.keys())
+
+
+def default_manifest_path(args: argparse.Namespace) -> Path:
+    shuffle_tag = "shuffle" if args.shuffle else "ordered"
+    return PATHS.data_dir / "manifests" / f"{args.split}_{shuffle_tag}_{args.max_per_class}_per_class_manifest.json"
+
+
+def load_manifest(manifest_path: Path) -> list[dict]:
+    with manifest_path.open("r", encoding="utf-8") as file:
+        payload = json.load(file)
+    if isinstance(payload, dict) and isinstance(payload.get("samples"), list):
+        return payload["samples"]
+    if isinstance(payload, list):
+        return payload
+    raise ValueError(f"Invalid manifest format: {manifest_path}")
+
+
+def save_manifest(manifest_path: Path, payload: dict) -> None:
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    with manifest_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+
+
+def build_metadata_manifest(args: argparse.Namespace, manifest_path: Path, logger: logging.Logger) -> list[dict]:
+    label2id = TRAINING.label2id
+    target_counts = {label: 0 for label in label2id}
+    samples: list[dict] = []
+    iterator = stream_metadata_samples(split=args.split, shuffle=args.shuffle, seed=args.seed, buffer_size=args.buffer_size)
+
+    for index, sample in enumerate(tqdm(iterator, desc="Scanning ViMD metadata")):
+        if index >= args.max_scan or all(count >= args.max_per_class for count in target_counts.values()):
+            break
+        if sample.region not in label2id or target_counts[sample.region] >= args.max_per_class:
+            continue
+        samples.append({
+            "stream_index": index,
+            "filename": sample.filename,
+            "region": sample.region,
+            "label_id": label2id[sample.region],
+            "speakerID": sample.speaker_id,
+            "text": sample.transcript,
+        })
+        target_counts[sample.region] += 1
+        logger.info("Manifest selected sample %s/%s | %s | counts=%s",
+                    len(samples), args.max_per_class * len(label2id), sample.filename, target_counts)
+
+    payload = {
+        "dataset_name": TRAINING.dataset_name,
+        "split": args.split,
+        "shuffle": args.shuffle,
+        "seed": args.seed,
+        "buffer_size": args.buffer_size,
+        "max_scan": args.max_scan,
+        "max_per_class": args.max_per_class,
+        "label2id": label2id,
+        "counts": target_counts,
+        "samples": samples,
+        "note": "Metadata-only manifest. Audio bytes are not stored in this file.",
+    }
+    save_manifest(manifest_path, payload)
+    logger.info("Saved metadata manifest: %s | samples=%s | counts=%s", manifest_path, len(samples), target_counts)
+    return samples
 
 
 def class_count_dict(y: np.ndarray) -> dict[str, int]:
@@ -87,13 +149,30 @@ def collect_features(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, 
     target_counts = {label: 0 for label in label2id}
     sequences, labels, speakers = [], [], []
     alignment_stats = {"segments": 0, "matched_or_replaced": 0, "interpolated_or_fallback": 0}
+    manifest_entries = load_manifest(Path(args.manifest_path)) if args.use_manifest else None
+    manifest_by_filename = None
+    processed_manifest_filenames: set[str] = set()
+    if manifest_entries is not None:
+        manifest_by_filename = {str(item["filename"]): item for item in manifest_entries}
+        logger.info("Using metadata manifest: %s | samples=%s", args.manifest_path, len(manifest_by_filename))
     whisper = WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type)
     temp_dir = PATHS.data_dir / "tmp_wav"
     temp_dir.mkdir(parents=True, exist_ok=True)
     iterator = stream_raw_samples(split=args.split, shuffle=args.shuffle, seed=args.seed, buffer_size=args.buffer_size)
     for index, sample in enumerate(tqdm(iterator, desc="Streaming ViMD")):
-        if index >= args.max_scan or all(count >= args.max_per_class for count in target_counts.values()):
+        manifest_done = manifest_by_filename is not None and len(processed_manifest_filenames) >= len(manifest_by_filename)
+        quota_done = manifest_by_filename is None and all(count >= args.max_per_class for count in target_counts.values())
+        if index >= args.max_scan or manifest_done or quota_done:
             break
+        if manifest_by_filename is not None:
+            manifest_item = manifest_by_filename.get(sample.filename)
+            if manifest_item is None or sample.filename in processed_manifest_filenames:
+                continue
+            if sample.region != manifest_item["region"]:
+                logger.warning("Skipping manifest sample with mismatched region | %s | stream=%s manifest=%s",
+                               sample.filename, sample.region, manifest_item["region"])
+                processed_manifest_filenames.add(sample.filename)
+                continue
         if sample.region not in label2id or target_counts[sample.region] >= args.max_per_class:
             continue
         try:
@@ -111,6 +190,8 @@ def collect_features(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, 
             labels.append(label2id[sample.region])
             speakers.append(sample.speaker_id)
             target_counts[sample.region] += 1
+            if manifest_by_filename is not None:
+                processed_manifest_filenames.add(sample.filename)
             logger.info("Collected valid sample %s/%s | %s | counts=%s", sum(target_counts.values()), args.max_per_class * len(label2id), sample.filename, target_counts)
         except Exception as exc:
             logger.warning("Skipping %s: %s", sample.filename, exc)
@@ -270,17 +351,31 @@ def main() -> None:
     parser.add_argument("--cache-path", default=None)
     parser.add_argument("--force-extract", action="store_true")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--manifest-path", default=None)
+    parser.add_argument("--build-manifest-only", action="store_true")
+    parser.add_argument("--use-manifest", action="store_true")
     args = parser.parse_args()
 
     ensure_dirs([PATHS.data_dir, PATHS.features_dir, PATHS.checkpoints_dir, PATHS.logs_dir])
     logger = setup_logging(PATHS.logs_dir)
     set_seed(args.seed)
+    manifest_path = Path(args.manifest_path) if args.manifest_path else default_manifest_path(args)
+    args.manifest_path = str(manifest_path)
+    if args.build_manifest_only:
+        build_metadata_manifest(args, manifest_path, logger)
+        return
+    if args.use_manifest and not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest file does not exist: {manifest_path}")
+
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda was requested, but CUDA is not available.")
-    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device)
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
     logger.info("Using PyTorch device: %s", device)
 
     cache_path = Path(args.cache_path) if args.cache_path else default_cache_path(args)
@@ -295,11 +390,11 @@ def main() -> None:
         save_cached_features(cache_path, x, y, speakers)
         logger.info("Saved feature cache: %s | shape=%s", cache_path, x.shape)
     log_feature_diagnostics(logger, x, y, speakers, prefix="Dataset")
-    expected_total = args.max_per_class * len(TRAINING.label2id)
+    expected_total = len(load_manifest(manifest_path)) if args.use_manifest else args.max_per_class * len(TRAINING.label2id)
     if len(y) != expected_total:
         logger.warning(
-            "Expected %s samples (%s per class), but cache/extraction contains %s samples. This can happen if not enough valid samples were found before max_scan.",
-            expected_total, args.max_per_class, len(y),
+            "Expected %s samples, but cache/extraction contains %s samples. This can happen if not enough valid samples were found before max_scan or some manifest samples failed feature extraction.",
+            expected_total, len(y),
         )
 
     x_train, x_val, x_test, y_train, y_val, y_test = split_data(x, y, args.seed, speakers, logger)
