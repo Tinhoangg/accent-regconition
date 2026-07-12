@@ -6,6 +6,8 @@ import argparse
 import csv
 import json
 import logging
+import os
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -143,7 +145,7 @@ def stratified_group_holdout(x: np.ndarray, y: np.ndarray, groups: np.ndarray, h
     return best_train_idx, best_holdout_idx
 
 
-def collect_features(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[str]]:
+def collect_features_serial(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[str]]:
     logger = setup_logging(PATHS.logs_dir)
     label2id = TRAINING.label2id
     target_counts = {label: 0 for label in label2id}
@@ -203,6 +205,174 @@ def collect_features(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, 
                     alignment_stats["segments"], alignment_stats["matched_or_replaced"], alignment_stats["interpolated_or_fallback"],
                     alignment_stats["matched_or_replaced"] / alignment_stats["segments"])
     return np.asarray(sequences, dtype=object), np.asarray(labels, dtype=np.int64), speakers
+
+
+_WORKER_WHISPER: WhisperModel | None = None
+_WORKER_TEMP_DIR: Path | None = None
+_WORKER_MIN_SYLLABLES = 3
+
+
+def init_feature_worker(whisper_model: str, whisper_device: str, whisper_compute_type: str, temp_dir: str, min_syllables: int) -> None:
+    global _WORKER_WHISPER, _WORKER_TEMP_DIR, _WORKER_MIN_SYLLABLES
+    _WORKER_WHISPER = WhisperModel(whisper_model, device=whisper_device, compute_type=whisper_compute_type)
+    _WORKER_TEMP_DIR = Path(temp_dir)
+    _WORKER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    _WORKER_MIN_SYLLABLES = min_syllables
+
+
+def raw_sample_payload(sample) -> dict:
+    return {
+        "audio_field": sample.audio_field,
+        "transcript": sample.transcript,
+        "region": sample.region,
+        "speaker_id": sample.speaker_id,
+        "filename": sample.filename,
+    }
+
+
+def extract_feature_worker(payload: dict) -> dict:
+    try:
+        if _WORKER_WHISPER is None or _WORKER_TEMP_DIR is None:
+            raise RuntimeError("Feature worker was not initialized.")
+        raw_audio, raw_sr = decode_audio_field(payload["audio_field"])
+        audio, sr = preprocess_audio(raw_audio, raw_sr)
+        safe_filename = str(payload["filename"]).replace("/", "_").replace("\\", "_")
+        temp_wav_path = _WORKER_TEMP_DIR / f"{os.getpid()}_{safe_filename}.wav"
+        segments = align_syllables(audio, sr, payload["transcript"], _WORKER_WHISPER, temp_wav_path)
+        sequence = extract_sequence(audio, sr, segments)
+        if sequence.shape[0] < _WORKER_MIN_SYLLABLES:
+            return {
+                "ok": False,
+                "filename": payload["filename"],
+                "region": payload["region"],
+                "reason": f"sequence has fewer than {_WORKER_MIN_SYLLABLES} syllables",
+                "skip": True,
+            }
+        matched_segments = sum(segment.score is not None for segment in segments)
+        return {
+            "ok": True,
+            "filename": payload["filename"],
+            "region": payload["region"],
+            "speaker_id": payload["speaker_id"],
+            "sequence": sequence,
+            "segments": len(segments),
+            "matched_or_replaced": matched_segments,
+            "interpolated_or_fallback": len(segments) - matched_segments,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "filename": payload.get("filename", "unknown"),
+            "region": payload.get("region", "unknown"),
+            "reason": str(exc),
+            "skip": False,
+        }
+
+
+def collect_features_parallel(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    logger = setup_logging(PATHS.logs_dir)
+    label2id = TRAINING.label2id
+    target_counts = {label: 0 for label in label2id}
+    pending_counts = {label: 0 for label in label2id}
+    sequences, labels, speakers = [], [], []
+    alignment_stats = {"segments": 0, "matched_or_replaced": 0, "interpolated_or_fallback": 0}
+    manifest_entries = load_manifest(Path(args.manifest_path)) if args.use_manifest else None
+    manifest_by_filename = None
+    processed_manifest_filenames: set[str] = set()
+    if manifest_entries is not None:
+        manifest_by_filename = {str(item["filename"]): item for item in manifest_entries}
+        logger.info("Using metadata manifest: %s | samples=%s", args.manifest_path, len(manifest_by_filename))
+    if args.whisper_device == "cuda":
+        logger.warning("num_workers=%s with whisper-device=cuda can increase VRAM use; CPU workers are usually safer.", args.num_workers)
+
+    temp_dir = PATHS.data_dir / "tmp_wav" / "workers"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    iterator = enumerate(tqdm(stream_raw_samples(split=args.split, shuffle=args.shuffle, seed=args.seed, buffer_size=args.buffer_size), desc="Streaming ViMD"))
+    pending = {}
+    max_pending = max(args.num_workers * 2, args.num_workers)
+    scan_done = False
+    submitted = 0
+
+    with ProcessPoolExecutor(
+        max_workers=args.num_workers,
+        initializer=init_feature_worker,
+        initargs=(args.whisper_model, args.whisper_device, args.whisper_compute_type, str(temp_dir), args.min_syllables),
+    ) as executor:
+        while True:
+            while len(pending) < max_pending and not scan_done:
+                manifest_done = manifest_by_filename is not None and len(processed_manifest_filenames) >= len(manifest_by_filename)
+                quota_done = manifest_by_filename is None and all(count >= args.max_per_class for count in target_counts.values())
+                if manifest_done or quota_done:
+                    scan_done = True
+                    break
+                try:
+                    index, sample = next(iterator)
+                except StopIteration:
+                    scan_done = True
+                    break
+                if index >= args.max_scan:
+                    scan_done = True
+                    break
+                if manifest_by_filename is not None:
+                    manifest_item = manifest_by_filename.get(sample.filename)
+                    if manifest_item is None or sample.filename in processed_manifest_filenames:
+                        continue
+                    if sample.region != manifest_item["region"]:
+                        logger.warning("Skipping manifest sample with mismatched region | %s | stream=%s manifest=%s",
+                                       sample.filename, sample.region, manifest_item["region"])
+                        processed_manifest_filenames.add(sample.filename)
+                        continue
+                if sample.region not in label2id:
+                    continue
+                if manifest_by_filename is None and target_counts[sample.region] + pending_counts[sample.region] >= args.max_per_class:
+                    continue
+                future = executor.submit(extract_feature_worker, raw_sample_payload(sample))
+                pending[future] = (sample.region, sample.filename)
+                pending_counts[sample.region] += 1
+                submitted += 1
+
+            if not pending:
+                if scan_done:
+                    break
+                continue
+
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                region, filename = pending.pop(future)
+                pending_counts[region] -= 1
+                result = future.result()
+                if manifest_by_filename is not None:
+                    processed_manifest_filenames.add(filename)
+                if result["ok"]:
+                    sequences.append(result["sequence"])
+                    labels.append(label2id[result["region"]])
+                    speakers.append(result["speaker_id"])
+                    target_counts[result["region"]] += 1
+                    alignment_stats["segments"] += result["segments"]
+                    alignment_stats["matched_or_replaced"] += result["matched_or_replaced"]
+                    alignment_stats["interpolated_or_fallback"] += result["interpolated_or_fallback"]
+                    logger.info("Collected valid sample %s/%s | %s | counts=%s",
+                                sum(target_counts.values()), args.max_per_class * len(label2id), result["filename"], target_counts)
+                else:
+                    logger.warning("Skipping %s: %s", result["filename"], result["reason"])
+
+            if scan_done and not pending:
+                break
+
+    if not sequences:
+        raise RuntimeError("No feature sequences were extracted.")
+    logger.info("Final collected counts: %s | submitted_jobs=%s", target_counts, submitted)
+    if alignment_stats["segments"]:
+        logger.info("Alignment diagnostics | segments=%s | matched_or_replaced=%s | interpolated_or_fallback=%s | matched_ratio=%.4f",
+                    alignment_stats["segments"], alignment_stats["matched_or_replaced"], alignment_stats["interpolated_or_fallback"],
+                    alignment_stats["matched_or_replaced"] / alignment_stats["segments"])
+    return np.asarray(sequences, dtype=object), np.asarray(labels, dtype=np.int64), speakers
+
+
+def collect_features(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    if args.num_workers <= 1:
+        return collect_features_serial(args)
+    return collect_features_parallel(args)
 
 
 def default_cache_path(args: argparse.Namespace) -> Path:
@@ -351,6 +521,7 @@ def main() -> None:
     parser.add_argument("--cache-path", default=None)
     parser.add_argument("--force-extract", action="store_true")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--manifest-path", default=None)
     parser.add_argument("--build-manifest-only", action="store_true")
     parser.add_argument("--use-manifest", action="store_true")
@@ -359,6 +530,8 @@ def main() -> None:
     ensure_dirs([PATHS.data_dir, PATHS.features_dir, PATHS.checkpoints_dir, PATHS.logs_dir])
     logger = setup_logging(PATHS.logs_dir)
     set_seed(args.seed)
+    if args.num_workers < 1:
+        raise ValueError("--num-workers must be >= 1")
     manifest_path = Path(args.manifest_path) if args.manifest_path else default_manifest_path(args)
     args.manifest_path = str(manifest_path)
     if args.build_manifest_only:
