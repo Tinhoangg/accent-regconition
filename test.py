@@ -13,7 +13,7 @@ from faster_whisper import WhisperModel
 
 from config import FEATURES, PATHS, TRAINING
 from feature_extraction import extract_features, extract_sequence
-from model import build_model
+from model import build_model_from_checkpoint
 from processing import align_syllables, preprocess_audio, preprocess_transcript, save_temp_wav
 
 
@@ -117,7 +117,7 @@ def main() -> None:
     label_names = list(checkpoint.get("label_names", TRAINING.label2id.keys()))
     mean = np.asarray(checkpoint["normalization_mean"], dtype=np.float32)
     std = np.asarray(checkpoint["normalization_std"], dtype=np.float32)
-    model = build_model(max_len, feature_dim, num_classes=len(label_names)).to(device)
+    model = build_model_from_checkpoint(checkpoint, feature_dim, num_classes=len(label_names)).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
@@ -163,3 +163,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

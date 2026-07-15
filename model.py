@@ -1,4 +1,4 @@
-"""PyTorch BiLSTM model for Vietnamese accent classification."""
+﻿"""PyTorch BiLSTM model for Vietnamese accent classification."""
 
 from __future__ import annotations
 
@@ -88,3 +88,38 @@ def build_model(
     """Build the accent model. max_len is kept for API compatibility."""
     _ = max_len
     return AccentBiLSTMPooling(feature_dim=feature_dim, num_classes=num_classes)
+
+def infer_model_config_from_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, int | float]:
+    """Infer model dimensions from a saved AccentBiLSTMPooling state dict."""
+    lstm_weight = state_dict["lstm.weight_ih_l0"]
+    attention_weight = state_dict["attention_pool.attention.0.weight"]
+    classifier_weight = state_dict["classifier.0.weight"]
+    lstm_hidden_dim = int(lstm_weight.shape[0] // 4)
+    attention_hidden_dim = int(attention_weight.shape[0])
+    dense_dim = int(classifier_weight.shape[0])
+    return {
+        "lstm_hidden_dim": lstm_hidden_dim,
+        "attention_hidden_dim": attention_hidden_dim,
+        "dense_dim": dense_dim,
+        "dropout": 0.35,
+    }
+
+
+def build_model_from_checkpoint(
+    checkpoint: dict,
+    feature_dim: int,
+    num_classes: int = 3,
+) -> AccentBiLSTMPooling:
+    """Build a model compatible with either old or new checkpoints."""
+    model_config = checkpoint.get("model_config")
+    if model_config is None:
+        model_config = infer_model_config_from_state_dict(checkpoint["state_dict"])
+    return AccentBiLSTMPooling(
+        feature_dim=feature_dim,
+        num_classes=num_classes,
+        lstm_hidden_dim=int(model_config.get("lstm_hidden_dim", 64)),
+        attention_hidden_dim=int(model_config.get("attention_hidden_dim", 64)),
+        dense_dim=int(model_config.get("dense_dim", 96)),
+        dropout=float(model_config.get("dropout", 0.35)),
+    )
+

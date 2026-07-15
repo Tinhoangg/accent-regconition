@@ -732,6 +732,12 @@ def save_torch_checkpoint(path: Path, model: nn.Module, mean: np.ndarray, std: n
         "feature_names": FEATURE_NAMES,
         "normalization_mean": mean,
         "normalization_std": std,
+        "model_config": {
+            "lstm_hidden_dim": getattr(model, "lstm_hidden_dim", 64),
+            "attention_hidden_dim": getattr(model.attention_pool.attention[0], "out_features", 64),
+            "dense_dim": getattr(model.classifier[0], "out_features", 96),
+            "dropout": getattr(model.classifier[2], "p", 0.35),
+        },
     }, path)
 
 
@@ -867,3 +873,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
