@@ -1,4 +1,4 @@
-﻿"""PyTorch BiLSTM model for Vietnamese accent classification."""
+"""PyTorch BiLSTM model for Vietnamese accent classification."""
 
 from __future__ import annotations
 
@@ -84,10 +84,21 @@ def build_model(
     max_len: int,
     feature_dim: int,
     num_classes: int = 3,
+    lstm_hidden_dim: int = 64,
+    attention_hidden_dim: int = 64,
+    dense_dim: int = 96,
+    dropout: float = 0.35,
 ) -> AccentBiLSTMPooling:
     """Build the accent model. max_len is kept for API compatibility."""
     _ = max_len
-    return AccentBiLSTMPooling(feature_dim=feature_dim, num_classes=num_classes)
+    return AccentBiLSTMPooling(
+        feature_dim=feature_dim,
+        num_classes=num_classes,
+        lstm_hidden_dim=lstm_hidden_dim,
+        attention_hidden_dim=attention_hidden_dim,
+        dense_dim=dense_dim,
+        dropout=dropout,
+    )
 
 def infer_model_config_from_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, int | float]:
     """Infer model dimensions from a saved AccentBiLSTMPooling state dict."""

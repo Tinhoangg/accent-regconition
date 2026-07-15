@@ -1,4 +1,4 @@
-﻿"""End-to-end PyTorch training script for Vietnamese accent recognition."""
+"""End-to-end PyTorch training script for Vietnamese accent recognition."""
 
 from __future__ import annotations
 
@@ -184,10 +184,16 @@ def collect_features_serial(args: argparse.Namespace) -> tuple[np.ndarray, np.nd
             segments = align_syllables(audio, sr, sample.transcript, whisper, temp_dir / f"{sample.filename}.wav")
             alignment_stats["segments"] += len(segments)
             matched_segments = sum(segment.score is not None for segment in segments)
+            matched_ratio = matched_segments / max(len(segments), 1)
             alignment_stats["matched_or_replaced"] += matched_segments
             alignment_stats["interpolated_or_fallback"] += len(segments) - matched_segments
             sequence = extract_sequence(audio, sr, segments)
-            if sequence.shape[0] < args.min_syllables:
+            min_sequence_len = max(args.min_syllables, args.min_sequence_len)
+            if sequence.shape[0] < min_sequence_len:
+                logger.warning("Skipping %s: sequence has fewer than %s frames", sample.filename, min_sequence_len)
+                continue
+            if matched_ratio < args.min_matched_ratio:
+                logger.warning("Skipping %s: matched_ratio %.3f < %.3f", sample.filename, matched_ratio, args.min_matched_ratio)
                 continue
             sequences.append(sequence)
             labels.append(label2id[sample.region])
@@ -211,14 +217,26 @@ def collect_features_serial(args: argparse.Namespace) -> tuple[np.ndarray, np.nd
 _WORKER_WHISPER: WhisperModel | None = None
 _WORKER_TEMP_DIR: Path | None = None
 _WORKER_MIN_SYLLABLES = 3
+_WORKER_MIN_MATCHED_RATIO = 0.0
+_WORKER_MIN_SEQUENCE_LEN = 0
 
 
-def init_feature_worker(whisper_model: str, whisper_device: str, whisper_compute_type: str, temp_dir: str, min_syllables: int) -> None:
-    global _WORKER_WHISPER, _WORKER_TEMP_DIR, _WORKER_MIN_SYLLABLES
+def init_feature_worker(
+    whisper_model: str,
+    whisper_device: str,
+    whisper_compute_type: str,
+    temp_dir: str,
+    min_syllables: int,
+    min_matched_ratio: float,
+    min_sequence_len: int,
+) -> None:
+    global _WORKER_WHISPER, _WORKER_TEMP_DIR, _WORKER_MIN_SYLLABLES, _WORKER_MIN_MATCHED_RATIO, _WORKER_MIN_SEQUENCE_LEN
     _WORKER_WHISPER = WhisperModel(whisper_model, device=whisper_device, compute_type=whisper_compute_type)
     _WORKER_TEMP_DIR = Path(temp_dir)
     _WORKER_TEMP_DIR.mkdir(parents=True, exist_ok=True)
     _WORKER_MIN_SYLLABLES = min_syllables
+    _WORKER_MIN_MATCHED_RATIO = min_matched_ratio
+    _WORKER_MIN_SEQUENCE_LEN = min_sequence_len
 
 
 def raw_sample_payload(sample) -> dict:
@@ -240,16 +258,26 @@ def extract_feature_worker(payload: dict) -> dict:
         safe_filename = str(payload["filename"]).replace("/", "_").replace("\\", "_")
         temp_wav_path = _WORKER_TEMP_DIR / f"{os.getpid()}_{safe_filename}.wav"
         segments = align_syllables(audio, sr, payload["transcript"], _WORKER_WHISPER, temp_wav_path)
+        matched_segments = sum(segment.score is not None for segment in segments)
+        matched_ratio = matched_segments / max(len(segments), 1)
         sequence = extract_sequence(audio, sr, segments)
-        if sequence.shape[0] < _WORKER_MIN_SYLLABLES:
+        min_sequence_len = max(_WORKER_MIN_SYLLABLES, _WORKER_MIN_SEQUENCE_LEN)
+        if sequence.shape[0] < min_sequence_len:
             return {
                 "ok": False,
                 "filename": payload["filename"],
                 "region": payload["region"],
-                "reason": f"sequence has fewer than {_WORKER_MIN_SYLLABLES} syllables",
+                "reason": f"sequence has fewer than {min_sequence_len} frames",
                 "skip": True,
             }
-        matched_segments = sum(segment.score is not None for segment in segments)
+        if matched_ratio < _WORKER_MIN_MATCHED_RATIO:
+            return {
+                "ok": False,
+                "filename": payload["filename"],
+                "region": payload["region"],
+                "reason": f"matched_ratio {matched_ratio:.3f} < {_WORKER_MIN_MATCHED_RATIO:.3f}",
+                "skip": True,
+            }
         return {
             "ok": True,
             "filename": payload["filename"],
@@ -259,6 +287,7 @@ def extract_feature_worker(payload: dict) -> dict:
             "segments": len(segments),
             "matched_or_replaced": matched_segments,
             "interpolated_or_fallback": len(segments) - matched_segments,
+            "matched_ratio": matched_ratio,
         }
     except Exception as exc:
         return {
@@ -297,7 +326,7 @@ def collect_features_parallel(args: argparse.Namespace) -> tuple[np.ndarray, np.
     with ProcessPoolExecutor(
         max_workers=args.num_workers,
         initializer=init_feature_worker,
-        initargs=(args.whisper_model, args.whisper_device, args.whisper_compute_type, str(temp_dir), args.min_syllables),
+        initargs=(args.whisper_model, args.whisper_device, args.whisper_compute_type, str(temp_dir), args.min_syllables, args.min_matched_ratio, args.min_sequence_len),
     ) as executor:
         while True:
             while len(pending) < max_pending and not scan_done:
@@ -352,8 +381,8 @@ def collect_features_parallel(args: argparse.Namespace) -> tuple[np.ndarray, np.
                     alignment_stats["segments"] += result["segments"]
                     alignment_stats["matched_or_replaced"] += result["matched_or_replaced"]
                     alignment_stats["interpolated_or_fallback"] += result["interpolated_or_fallback"]
-                    logger.info("Collected valid sample %s/%s | %s | counts=%s",
-                                sum(target_counts.values()), args.max_per_class * len(label2id), result["filename"], target_counts)
+                    logger.info("Collected valid sample %s/%s | %s | matched_ratio=%.3f | counts=%s",
+                                sum(target_counts.values()), args.max_per_class * len(label2id), result["filename"], result.get("matched_ratio", 0.0), target_counts)
                 else:
                     logger.warning("Skipping %s: %s", result["filename"], result["reason"])
 
@@ -387,6 +416,7 @@ def save_feature_chunk(
     labels: list[int],
     speakers: list[str],
     filenames: list[str],
+    matched_ratios: list[float] | None,
     max_len: int,
     logger: logging.Logger,
 ) -> Path:
@@ -402,6 +432,7 @@ def save_feature_chunk(
         y=y_chunk,
         speakers=np.asarray(speakers),
         filenames=np.asarray(filenames),
+        matched_ratios=np.asarray(matched_ratios if matched_ratios is not None else []),
         feature_names=np.asarray(FEATURE_NAMES),
         label_names=np.asarray(LABEL_NAMES),
     )
@@ -483,19 +514,21 @@ def collect_features_chunked(args: argparse.Namespace, cache_path: Path) -> tupl
     chunk_labels: list[int] = []
     chunk_speakers: list[str] = []
     chunk_filenames: list[str] = []
+    chunk_matched_ratios: list[float] = []
     alignment_stats = {"segments": 0, "matched_or_replaced": 0, "interpolated_or_fallback": 0}
     scanned = 0
 
     def flush_chunk() -> None:
-        nonlocal next_chunk_id, chunk_sequences, chunk_labels, chunk_speakers, chunk_filenames
+        nonlocal next_chunk_id, chunk_sequences, chunk_labels, chunk_speakers, chunk_filenames, chunk_matched_ratios
         if not chunk_sequences:
             return
-        save_feature_chunk(chunk_dir, next_chunk_id, chunk_sequences, chunk_labels, chunk_speakers, chunk_filenames, args.max_len, logger)
+        save_feature_chunk(chunk_dir, next_chunk_id, chunk_sequences, chunk_labels, chunk_speakers, chunk_filenames, chunk_matched_ratios, args.max_len, logger)
         next_chunk_id += 1
         chunk_sequences.clear()
         chunk_labels.clear()
         chunk_speakers.clear()
         chunk_filenames.clear()
+        chunk_matched_ratios.clear()
         gc.collect()
 
     for index, sample in enumerate(tqdm(iterator, desc="Streaming ViMD")):
@@ -516,20 +549,27 @@ def collect_features_chunked(args: argparse.Namespace, cache_path: Path) -> tupl
             safe_filename = str(sample.filename).replace("/", "_").replace("\\", "_")
             segments = align_syllables(audio, sr, sample.transcript, whisper, temp_dir / f"chunk_{safe_filename}.wav")
             matched_segments = sum(segment.score is not None for segment in segments)
+            matched_ratio = matched_segments / max(len(segments), 1)
             alignment_stats["segments"] += len(segments)
             alignment_stats["matched_or_replaced"] += matched_segments
             alignment_stats["interpolated_or_fallback"] += len(segments) - matched_segments
             sequence = extract_sequence(audio, sr, segments)
-            if sequence.shape[0] < args.min_syllables:
+            min_sequence_len = max(args.min_syllables, args.min_sequence_len)
+            if sequence.shape[0] < min_sequence_len:
+                logger.warning("Skipping %s: sequence has fewer than %s frames", sample.filename, min_sequence_len)
+                continue
+            if matched_ratio < args.min_matched_ratio:
+                logger.warning("Skipping %s: matched_ratio %.3f < %.3f", sample.filename, matched_ratio, args.min_matched_ratio)
                 continue
             chunk_sequences.append(sequence)
             chunk_labels.append(label2id[sample.region])
             chunk_speakers.append(sample.speaker_id)
             chunk_filenames.append(sample.filename)
+            chunk_matched_ratios.append(matched_ratio)
             done_filenames.add(sample.filename)
             target_counts[sample.region] += 1
-            logger.info("Collected valid sample %s/%s | %s | counts=%s",
-                        sum(target_counts.values()), args.max_per_class * len(label2id), sample.filename, target_counts)
+            logger.info("Collected valid sample %s/%s | %s | matched_ratio=%.3f | counts=%s",
+                        sum(target_counts.values()), args.max_per_class * len(label2id), sample.filename, matched_ratio, target_counts)
             if len(chunk_sequences) >= args.chunk_size:
                 flush_chunk()
         except Exception as exc:
@@ -694,8 +734,30 @@ def make_loader(x: np.ndarray, y: np.ndarray, batch_size: int, shuffle: bool) ->
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
-def run_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device: torch.device,
-              optimizer: torch.optim.Optimizer | None = None) -> tuple[float, float, np.ndarray, np.ndarray]:
+def augment_features(batch_x: torch.Tensor, noise_std: float = 0.0, frame_drop_prob: float = 0.0) -> torch.Tensor:
+    """Apply train-only augmentation to non-padding feature frames."""
+    if noise_std <= 0 and frame_drop_prob <= 0:
+        return batch_x
+    mask = torch.any(batch_x != 0.0, dim=-1, keepdim=True)
+    if noise_std > 0:
+        noise = torch.randn_like(batch_x) * noise_std
+        batch_x = torch.where(mask, batch_x + noise, batch_x)
+    if frame_drop_prob > 0:
+        frame_mask = mask.squeeze(-1)
+        drop_mask = (torch.rand(frame_mask.shape, device=batch_x.device) < frame_drop_prob) & frame_mask
+        batch_x = batch_x.masked_fill(drop_mask.unsqueeze(-1), 0.0)
+    return batch_x
+
+
+def run_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer | None = None,
+    feature_noise_std: float = 0.0,
+    frame_drop_prob: float = 0.0,
+) -> tuple[float, float, np.ndarray, np.ndarray]:
     is_train = optimizer is not None
     model.train(is_train)
     total_loss = 0.0
@@ -705,6 +767,7 @@ def run_epoch(model: nn.Module, loader: DataLoader, criterion: nn.Module, device
         batch_x = batch_x.to(device)
         batch_y = batch_y.to(device)
         if is_train:
+            batch_x = augment_features(batch_x, feature_noise_std, frame_drop_prob)
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(is_train):
             logits = model(batch_x)
@@ -766,6 +829,18 @@ def main() -> None:
     parser.add_argument("--debug-syllables-only", type=int, default=0)
     parser.add_argument("--chunk-size", type=int, default=0, help="Save feature extraction chunks every N valid samples; enables resume.")
     parser.add_argument("--chunk-dir", default=None, help="Optional directory for feature chunks.")
+    parser.add_argument("--learning-rate", type=float, default=TRAINING.learning_rate)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--patience", type=int, default=0, help="Early stop after N epochs without val_macro_f1 improvement; 0 disables.")
+    parser.add_argument("--lstm-hidden-dim", type=int, default=64)
+    parser.add_argument("--attention-hidden-dim", type=int, default=64)
+    parser.add_argument("--dense-dim", type=int, default=96)
+    parser.add_argument("--dropout", type=float, default=0.35)
+    parser.add_argument("--feature-noise-std", type=float, default=0.0)
+    parser.add_argument("--frame-drop-prob", type=float, default=0.0)
+    parser.add_argument("--min-matched-ratio", type=float, default=0.0, help="Skip newly extracted samples below this alignment matched ratio.")
+    parser.add_argument("--min-sequence-len", type=int, default=0, help="Skip newly extracted samples with fewer feature frames; combined with --min-syllables.")
     args = parser.parse_args()
 
     ensure_dirs([PATHS.data_dir, PATHS.features_dir, PATHS.checkpoints_dir, PATHS.logs_dir])
@@ -825,37 +900,62 @@ def main() -> None:
     val_loader = make_loader(x_val, y_val, args.batch_size, shuffle=False)
     test_loader = make_loader(x_test, y_test, args.batch_size, shuffle=False)
 
-    model = build_model(args.max_len, FEATURES.feature_dim, num_classes=len(TRAINING.label2id)).to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=TRAINING.learning_rate, weight_decay=1e-4)
+    model = build_model(
+        args.max_len,
+        FEATURES.feature_dim,
+        num_classes=len(TRAINING.label2id),
+        lstm_hidden_dim=args.lstm_hidden_dim,
+        attention_hidden_dim=args.attention_hidden_dim,
+        dense_dim=args.dense_dim,
+        dropout=args.dropout,
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
-    history: dict[str, list[float]] = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
-    best_val_accuracy = -1.0
+    history: dict[str, list[float]] = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": [], "val_macro_f1": []}
+    best_val_macro_f1 = -1.0
+    epochs_without_improvement = 0
     best_model_path = PATHS.checkpoints_dir / "best_model.pt"
     final_model_path = PATHS.checkpoints_dir / "final_model.pt"
 
     for epoch in range(args.epochs):
-        train_loss, train_acc, _, _ = run_epoch(model, train_loader, criterion, device, optimizer)
-        val_loss, val_acc, _, _ = run_epoch(model, val_loader, criterion, device)
+        train_loss, train_acc, _, _ = run_epoch(
+            model,
+            train_loader,
+            criterion,
+            device,
+            optimizer,
+            feature_noise_std=args.feature_noise_std,
+            frame_drop_prob=args.frame_drop_prob,
+        )
+        val_loss, val_acc, val_true, val_predictions = run_epoch(model, val_loader, criterion, device)
+        val_macro_f1 = f1_score(val_true, val_predictions, average="macro", zero_division=0)
         history["loss"].append(train_loss)
         history["accuracy"].append(train_acc)
         history["val_loss"].append(val_loss)
         history["val_accuracy"].append(val_acc)
+        history["val_macro_f1"].append(val_macro_f1)
         logger.info(
-            "Epoch %s/%s | loss=%.4f accuracy=%.4f | val_loss=%.4f val_accuracy=%.4f",
-            epoch + 1, args.epochs, train_loss, train_acc, val_loss, val_acc,
+            "Epoch %s/%s | loss=%.4f accuracy=%.4f | val_loss=%.4f val_accuracy=%.4f val_macro_f1=%.4f",
+            epoch + 1, args.epochs, train_loss, train_acc, val_loss, val_acc, val_macro_f1,
         )
-        if val_acc > best_val_accuracy:
-            best_val_accuracy = val_acc
+        if val_macro_f1 > best_val_macro_f1:
+            best_val_macro_f1 = val_macro_f1
+            epochs_without_improvement = 0
             save_torch_checkpoint(best_model_path, model, mean, std, args)
+        else:
+            epochs_without_improvement += 1
+            if args.patience > 0 and epochs_without_improvement >= args.patience:
+                logger.info("Early stopping at epoch %s | best_val_macro_f1=%.4f", epoch + 1, best_val_macro_f1)
+                break
 
     with (PATHS.logs_dir / "history.json").open("w", encoding="utf-8") as file:
         json.dump(history, file, ensure_ascii=False, indent=2)
     with (PATHS.logs_dir / "history.csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
-        writer.writerow(["epoch", "accuracy", "loss", "val_accuracy", "val_loss"])
+        writer.writerow(["epoch", "accuracy", "loss", "val_accuracy", "val_loss", "val_macro_f1"])
         for idx in range(len(history["loss"])):
-            writer.writerow([idx, history["accuracy"][idx], history["loss"][idx], history["val_accuracy"][idx], history["val_loss"][idx]])
+            writer.writerow([idx, history["accuracy"][idx], history["loss"][idx], history["val_accuracy"][idx], history["val_loss"][idx], history["val_macro_f1"][idx]])
 
     checkpoint = torch.load(best_model_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["state_dict"])
@@ -873,6 +973,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 
 
