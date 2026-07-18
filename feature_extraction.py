@@ -237,3 +237,28 @@ def extract_sequence(
     if not vectors:
         return np.empty((0, FEATURES.feature_dim), dtype=np.float32)
     return np.vstack(vectors).astype(np.float32)
+
+
+def extract_sequence_with_wav2vec(
+    audio: np.ndarray,
+    sr: int,
+    segments: list[SyllableSegment],
+    wav2vec_extractor,
+) -> np.ndarray:
+    """Extract handcrafted features and concatenate Wav2Vec2 features per syllable."""
+    vectors = []
+    valid_segments = []
+    for segment in segments:
+        syllable_audio = crop_segment(audio, sr, segment.start, segment.end)
+        if len(syllable_audio) < int(AUDIO.min_syllable_duration * sr):
+            continue
+        vectors.append(extract_features(syllable_audio, sr))
+        valid_segments.append(segment)
+    if not vectors:
+        wav2vec_dim = int(getattr(getattr(wav2vec_extractor, "config", None), "output_dim", 0))
+        return np.empty((0, FEATURES.feature_dim + wav2vec_dim), dtype=np.float32)
+    handcrafted = np.vstack(vectors).astype(np.float32)
+    wav2vec = wav2vec_extractor.extract_for_segments(audio, sr, valid_segments)
+    if wav2vec.shape[0] != handcrafted.shape[0]:
+        raise ValueError(f"Wav2Vec2 sequence length mismatch: {wav2vec.shape[0]} != {handcrafted.shape[0]}")
+    return np.concatenate([handcrafted, wav2vec], axis=1).astype(np.float32)

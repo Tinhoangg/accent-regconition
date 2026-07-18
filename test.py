@@ -12,9 +12,10 @@ import torch
 from faster_whisper import WhisperModel
 
 from config import FEATURES, PATHS, TRAINING
-from feature_extraction import extract_features, extract_sequence
+from feature_extraction import extract_features, extract_sequence, extract_sequence_with_wav2vec
 from model import build_model_from_checkpoint
 from processing import align_syllables, preprocess_audio, preprocess_transcript, save_temp_wav
+from wav2vec_features import wav2vec_extractor_from_checkpoint
 
 
 def load_audio_file(audio_path: Path) -> tuple[np.ndarray, int]:
@@ -93,6 +94,7 @@ def main() -> None:
     parser.add_argument("--whisper-device", default=TRAINING.whisper_device)
     parser.add_argument("--whisper-compute-type", default=TRAINING.whisper_compute_type)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
+    parser.add_argument("--wav2vec-device", default="cpu", choices=["auto", "cpu", "cuda"], help="Device for Wav2Vec2 feature extraction when the checkpoint requires it.")
     args = parser.parse_args()
 
     audio_path = Path(args.audio)
@@ -109,7 +111,10 @@ def main() -> None:
 
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda was requested, but CUDA is not available.")
-    device = torch.device("cuda" if args.device == "auto" and torch.cuda.is_available() else args.device)
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
     max_len = int(checkpoint["max_len"])
@@ -121,6 +126,8 @@ def main() -> None:
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
+    wav2vec_device = "cuda" if args.wav2vec_device == "auto" and torch.cuda.is_available() else args.wav2vec_device
+    wav2vec_extractor = wav2vec_extractor_from_checkpoint(checkpoint, wav2vec_device)
     whisper = WhisperModel(args.whisper_model, device=args.whisper_device, compute_type=args.whisper_compute_type)
     audio, sr = load_audio_file(audio_path)
     with tempfile.TemporaryDirectory(prefix="accent_test_") as tmpdir:
@@ -130,11 +137,16 @@ def main() -> None:
 
         if transcript:
             segments = align_syllables(audio, sr, transcript, whisper, temp_wav)
-            sequence = extract_sequence(audio, sr, segments)
+            if wav2vec_extractor is None:
+                sequence = extract_sequence(audio, sr, segments)
+            else:
+                sequence = extract_sequence_with_wav2vec(audio, sr, segments, wav2vec_extractor)
             if sequence.size == 0:
                 raise RuntimeError("Transcript was available but no syllable features were extracted.")
             print("Mode: transcript-aligned")
         else:
+            if wav2vec_extractor is not None:
+                raise RuntimeError("Wav2Vec2 checkpoint requires a transcript; audio-only fallback is disabled for this model.")
             sequence = extract_fallback_sequence(audio, sr, max_len)
             if sequence.size == 0:
                 raise RuntimeError("Whisper could not produce a transcript and fallback chunking also failed.")

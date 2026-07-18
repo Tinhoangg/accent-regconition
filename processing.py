@@ -1,4 +1,4 @@
-"""Streaming, preprocessing and syllable timestamp alignment utilities."""
+﻿"""Streaming, preprocessing and syllable timestamp alignment utilities."""
 
 from __future__ import annotations
 
@@ -18,16 +18,6 @@ from datasets import Audio, load_dataset
 from faster_whisper import WhisperModel
 
 from config import AUDIO, TRAINING
-
-
-@dataclass
-class MetadataStreamSample:
-    """A streaming sample containing only dataset metadata."""
-
-    transcript: str
-    region: str
-    speaker_id: str
-    filename: str
 
 
 @dataclass
@@ -88,7 +78,7 @@ def preprocess_audio(audio: np.ndarray, sr: int, target_sr: int = AUDIO.sample_r
 def preprocess_transcript(text: str) -> str:
     """Lowercase, remove punctuation and normalize whitespace."""
     text = unicodedata.normalize("NFC", str(text)).lower()
-    punctuation = string.punctuation + "“”‘’…–—.,;:!?()[]{}"
+    punctuation = string.punctuation + "\u2018\u2019\u201c\u201d\u2026\u2013\u2014,;:!?()[]{}"
     text = text.translate(str.maketrans({char: " " for char in punctuation}))
     text = re.sub(r"\s+", " ", text).strip()
     return text
@@ -107,34 +97,6 @@ def decode_audio_field(audio_field: dict) -> tuple[np.ndarray, int]:
         raise ValueError(f"Audio bytes are missing for path={audio_field.get('path')}")
     audio, sr = sf.read(io.BytesIO(audio_bytes), always_2d=False)
     return audio, int(sr)
-
-
-def stream_metadata_samples(
-    dataset_name: str = TRAINING.dataset_name,
-    split: str = TRAINING.split,
-    shuffle: bool = False,
-    seed: int = TRAINING.random_state,
-    buffer_size: int = 1000,
-) -> Generator[MetadataStreamSample, None, None]:
-    """Stream ViMD metadata without materializing the audio column."""
-    dataset = load_dataset(dataset_name, split=split, streaming=True)
-    if "audio" in getattr(dataset, "column_names", []):
-        dataset = dataset.cast_column("audio", Audio(decode=False))
-        dataset = dataset.remove_columns(["audio"])
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=buffer_size, seed=seed)
-
-    for item in dataset:
-        try:
-            yield MetadataStreamSample(
-                transcript=preprocess_transcript(item["text"]),
-                region=str(item["region"]),
-                speaker_id=str(item["speakerID"]),
-                filename=str(item["filename"]),
-            )
-        except Exception:
-            continue
-
 
 def stream_raw_samples(
     dataset_name: str = TRAINING.dataset_name,
@@ -213,6 +175,7 @@ def _similar_word_key(left: str, right: str) -> bool:
     if left == right:
         return True
     return SequenceMatcher(a=left, b=right, autojunk=False).ratio() >= 0.78
+
 
 def transcribe_word_timestamps(model: WhisperModel, wav_path: Path) -> list[SyllableSegment]:
     """Use faster-whisper native word timestamps as timing anchors."""
@@ -326,3 +289,6 @@ def crop_segment(audio: np.ndarray, sr: int, start: float, end: float) -> np.nda
     start_idx = max(0, int(start * sr))
     end_idx = min(len(audio), int(end * sr))
     return audio[start_idx:end_idx]
+
+
+
