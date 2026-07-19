@@ -1,4 +1,4 @@
-﻿"""Feature-group ablation experiments for the 68D accent feature cache."""
+﻿"""Feature-group ablation experiments for accent feature caches."""
 
 from __future__ import annotations
 
@@ -39,9 +39,12 @@ DEFAULT_EXPERIMENTS = [
     "no_mfcc",
     "no_energy",
     "no_spectral",
+    "no_wav2vec",
     "formant_only",
     "pitch_only",
     "formant_pitch_only",
+    "wav2vec_only",
+    "handcrafted_only",
 ]
 
 
@@ -64,8 +67,9 @@ def setup_ablation_logger(log_dir: Path, experiment: str | None = None) -> loggi
     return logger
 
 
-def feature_groups() -> dict[str, list[int]]:
-    """Return fixed feature-group indexes for the 68D feature vector."""
+def feature_groups(feature_dim: int | None = None) -> dict[str, list[int]]:
+    """Return feature-group indexes for 68D or 68D+Wav2Vec caches."""
+    feature_dim = FEATURES.feature_dim if feature_dim is None else int(feature_dim)
     groups = {
         "duration": [0],
         "formant": list(range(1, 9)),
@@ -74,19 +78,21 @@ def feature_groups() -> dict[str, list[int]]:
         "energy": list(range(58, 60)),
         "spectral": list(range(60, 68)),
     }
+    if feature_dim > FEATURES.feature_dim:
+        groups["wav2vec"] = list(range(FEATURES.feature_dim, feature_dim))
     all_indexes = sorted(idx for indexes in groups.values() for idx in indexes)
-    expected = list(range(FEATURES.feature_dim))
+    expected = list(range(feature_dim))
     if all_indexes != expected:
-        raise ValueError(f"Feature groups do not cover 0..{FEATURES.feature_dim - 1}")
-    if len(FEATURE_NAMES) != FEATURES.feature_dim:
-        raise ValueError(f"Expected {FEATURES.feature_dim} feature names, got {len(FEATURE_NAMES)}")
+        raise ValueError(f"Feature groups do not cover 0..{feature_dim - 1}")
     return groups
 
 
-def print_feature_groups() -> None:
+def print_feature_groups(feature_dim: int | None = None) -> None:
     """Print feature groups with indexes and names."""
-    for group_name, indexes in feature_groups().items():
-        names = [FEATURE_NAMES[idx] for idx in indexes]
+    feature_dim = FEATURES.feature_dim if feature_dim is None else int(feature_dim)
+    names_for_dim = list(FEATURE_NAMES) + [f"wav2vec_{idx:03d}" for idx in range(max(0, feature_dim - FEATURES.feature_dim))]
+    for group_name, indexes in feature_groups(feature_dim).items():
+        names = [names_for_dim[idx] for idx in indexes]
         print(f"{group_name}: {len(indexes)} dims | indexes={indexes}")
         print("  " + ", ".join(names))
 
@@ -102,9 +108,9 @@ def expand_experiments(experiments: list[str]) -> list[str]:
     return expanded
 
 
-def active_feature_indexes(experiment: str, groups: dict[str, list[int]]) -> list[int]:
+def active_feature_indexes(experiment: str, groups: dict[str, list[int]], feature_dim: int) -> list[int]:
     """Return feature indexes kept active for one experiment."""
-    all_indexes = set(range(FEATURES.feature_dim))
+    all_indexes = set(range(feature_dim))
     if experiment == "all_features":
         return sorted(all_indexes)
     if experiment.startswith("no_"):
@@ -118,13 +124,18 @@ def active_feature_indexes(experiment: str, groups: dict[str, list[int]]) -> lis
         return groups["pitch"]
     if experiment == "formant_pitch_only":
         return sorted(groups["formant"] + groups["pitch"])
+    if experiment == "wav2vec_only":
+        if "wav2vec" not in groups:
+            raise ValueError("wav2vec_only requires a cache with feature_dim > 68")
+        return groups["wav2vec"]
+    if experiment == "handcrafted_only":
+        return sorted(idx for name in ("duration", "formant", "pitch", "mfcc", "energy", "spectral") for idx in groups[name])
     raise ValueError(f"Unknown experiment: {experiment}")
-
 
 def mask_features(x: np.ndarray, active_indexes: list[int]) -> np.ndarray:
     """Return a copy of x with inactive feature dimensions zeroed out."""
     masked = x.copy()
-    active_mask = np.zeros(FEATURES.feature_dim, dtype=bool)
+    active_mask = np.zeros(x.shape[-1], dtype=bool)
     active_mask[active_indexes] = True
     masked[..., ~active_mask] = 0.0
     return masked
@@ -208,7 +219,8 @@ def train_one_experiment(
 
     experiment_log_dir = PATHS.logs_dir / "ablation" / experiment
     logger = setup_ablation_logger(experiment_log_dir, experiment)
-    active_indexes = active_feature_indexes(experiment, groups)
+    feature_dim = int(x.shape[-1])
+    active_indexes = active_feature_indexes(experiment, groups, feature_dim)
     logger.info("Starting experiment=%s | active_dim=%s | active_indexes=%s", experiment, len(active_indexes), active_indexes)
 
     set_seed(args.seed)
@@ -225,7 +237,10 @@ def train_one_experiment(
     val_loader = make_loader(x_val, y_val, args.batch_size, shuffle=False)
     test_loader = make_loader(x_test, y_test, args.batch_size, shuffle=False)
 
-    model = build_model(args.max_len, FEATURES.feature_dim, num_classes=len(TRAINING.label2id)).to(args.torch_device)
+    args.feature_dim = feature_dim
+    args.feature_names = list(FEATURE_NAMES) + [f"wav2vec_{idx:03d}" for idx in range(max(0, feature_dim - FEATURES.feature_dim))]
+    args.use_wav2vec_features = False
+    model = build_model(args.max_len, feature_dim, num_classes=len(TRAINING.label2id)).to(args.torch_device)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
 
@@ -314,7 +329,6 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    groups = feature_groups()
     if args.print_feature_groups:
         print_feature_groups()
         return
@@ -344,6 +358,7 @@ def main() -> None:
         raise RuntimeError(f"Could not load feature cache: {cache_path}")
     x, y, speakers = cached
     logger.info("Loaded cache: %s | shape=%s | samples=%s", cache_path, x.shape, len(y))
+    groups = feature_groups(int(x.shape[-1]))
 
     experiments = expand_experiments(args.experiments)
     logger.info("Experiments: %s", experiments)
